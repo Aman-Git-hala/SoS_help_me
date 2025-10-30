@@ -1,6 +1,6 @@
 # Our application is live
-
-## Download the apk from the right side release in the repository
+## download link https://github.com/Aman-Git-hala/SoS_help_me/releases/download/Final_Release/app-release.apk
+## OR Download the apk from the right side release in the repository
 
 # Works without the internet, with bluetooth using P2P mesh
 
