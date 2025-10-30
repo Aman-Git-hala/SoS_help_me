@@ -1,11 +1,8 @@
 # Our application is live
 ## download link(for ANDROID only) https://github.com/Aman-Git-hala/SoS_help_me/releases/download/Final_Release/app-release.apk
-## OR Download the apk from the right side release in the repository
 
-# Works without the internet, with bluetooth using P2P mesh
-
+## Works without the internet, with bluetooth using P2P mesh
 ### Understanding the UI of our app
-
 #### 1. Sending a distress call in a disaster
 <p align="center">
   <img width="248" height="502" alt="image" src="https://github.com/user-attachments/assets/30c57acf-7969-4fb9-99ce-7e59f2a1ebc8" />
