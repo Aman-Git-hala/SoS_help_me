@@ -11,11 +11,14 @@ dependencies:
     sdk: flutter
 
   # --- YOUR 4 CORE TOOLS ---
-  flutter_blue_plus: ^1.31.13    # The "Ears"
-  flutter_ble_peripheral: ^1.2.1  # The "Mouth"
-  permission_handler: ^11.3.1   # For permissions
-  uuid: ^4.4.0               # For packet IDs
-  # --- END YOUR TOOLS ---
+  flutter_blue_plus: ^1.31.13    
+  flutter_ble_peripheral: ^1.2.1  
+  permission_handler: ^11.3.1   
+  uuid: ^4.4.0               
+  geolocator: ^12.0.0
+  
+  # --- NEW "OPEN IN MAPS" PACKAGE ---
+  url_launcher: ^6.3.1
 
   cupertino_icons: ^1.0.6
 

@@ -1,43 +1,14 @@
 import 'dart:async';
 import 'dart:typed_data';
+import 'dart:math';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:permission_handler/permission_handler.dart';
 import 'package:flutter_blue_plus/flutter_blue_plus.dart';
 import 'package:flutter_ble_peripheral/flutter_ble_peripheral.dart';
 import 'package:uuid/uuid.dart';
-
-// --- NEW DATA MODEL ---
-// We now store the packet 'type' to know what alert it was
-class Alert {
-  final int type; // 0x01=SOS, 0x02=Medical, 0x03=Rescue
-  final String packetId;
-  final DateTime timestamp;
-  final int rssi; // Signal Strength
-
-  Alert({
-    required this.type,
-    required this.packetId,
-    required this.timestamp,
-    required this.rssi,
-  });
-}
-
-// --- NEW HELPER CLASS ---
-// This holds the "authentic" info for each alert type
-class AlertType {
-  final String title;
-  final IconData icon;
-  final Color color;
-  final int packetCode; // The byte we send
-
-  AlertType({
-    required this.title,
-    required this.icon,
-    required this.color,
-    required this.packetCode,
-  });
-}
-// --- END NEW ---
+import 'package:geolocator/geolocator.dart';
+import 'package:url_launcher/url_launcher.dart';
 
 class LocalAlertsScreen extends StatefulWidget {
   const LocalAlertsScreen({Key? key}) : super(key: key);
@@ -46,23 +17,59 @@ class LocalAlertsScreen extends StatefulWidget {
   State<LocalAlertsScreen> createState() => _LocalAlertsScreenState();
 }
 
-class _LocalAlertsScreenState extends State<LocalAlertsScreen> {
+class Alert {
+  final int type;
+  final String packetId;
+  final DateTime timestamp;
+  final int rssi;
+  final bool isEncrypted;
+  final double? lat;
+  final double? lon;
+
+  Alert({
+    required this.type,
+    required this.packetId,
+    required this.timestamp,
+    required this.rssi,
+    required this.isEncrypted,
+    this.lat,
+    this.lon,
+  });
+}
+
+class AlertType {
+  final String title;
+  final IconData icon;
+  final Color color;
+  final int packetCode;
+
+  AlertType({
+    required this.title,
+    required this.icon,
+    required this.color,
+    required this.packetCode,
+  });
+}
+
+class _LocalAlertsScreenState extends State<LocalAlertsScreen>
+    with TickerProviderStateMixin {
   bool _permissionsGranted = false;
   String _permissionStatus = "Initializing...";
   bool _canOpenSettings = false;
 
   final int _companyId = 0x1234;
-  final Set<String> _seenPacketIds = {};
-  final List<Alert> _receivedAlerts = []; // Now a List<Alert>
-
+  final Map<String, Alert> _receivedAlerts = {};
   bool _isBroadcasting = false;
-  final Uuid _uuid = Uuid();
+  bool _isEncrypted = false;
+  final Uuid _uuid = Uuid(); // We still need this for the *real* packet ID
   final FlutterBlePeripheral _peripheral = FlutterBlePeripheral();
+  final Random _random = Random();
 
   StreamSubscription<List<ScanResult>>? _scanSub;
   StreamSubscription<BluetoothAdapterState>? _adapterStateSub;
 
-  // --- NEW: Map of our alert types ---
+  late AnimationController _pulseController;
+
   final Map<int, AlertType> _alertTypes = {
     0x01: AlertType(
         title: "SOS / General",
@@ -80,18 +87,23 @@ class _LocalAlertsScreenState extends State<LocalAlertsScreen> {
         color: Colors.orange[400]!,
         packetCode: 0x03),
   };
-  // --- END NEW ---
 
   @override
   void initState() {
     super.initState();
     _checkBluetoothState();
+
+    _pulseController = AnimationController(
+      vsync: this,
+      duration: const Duration(milliseconds: 700),
+    )..repeat(reverse: true);
   }
 
   @override
   void dispose() {
     _adapterStateSub?.cancel();
     _scanSub?.cancel();
+    _pulseController.dispose();
     FlutterBluePlus.stopScan();
     if (_isBroadcasting) {
       _peripheral.stop();
@@ -102,11 +114,9 @@ class _LocalAlertsScreenState extends State<LocalAlertsScreen> {
   Future<void> _checkBluetoothState() async {
     if (!await FlutterBluePlus.isAvailable) {
       if (mounted)
-        setState(() =>
-            _permissionStatus = "Bluetooth not supported on this device.");
+        setState(() => _permissionStatus = "Bluetooth not supported.");
       return;
     }
-
     _adapterStateSub = FlutterBluePlus.adapterState.listen((state) {
       if (mounted) {
         if (state == BluetoothAdapterState.on) {
@@ -123,7 +133,7 @@ class _LocalAlertsScreenState extends State<LocalAlertsScreen> {
 
   Future<void> _requestPermissions() async {
     Map<Permission, PermissionStatus> statuses = await [
-      Permission.location,
+      Permission.locationWhenInUse,
       Permission.bluetoothScan,
       Permission.bluetoothAdvertise,
       Permission.bluetoothConnect,
@@ -153,7 +163,6 @@ class _LocalAlertsScreenState extends State<LocalAlertsScreen> {
         _canOpenSettings = canOpenSettings;
       });
     }
-
     if (allGranted) {
       startScanning();
     }
@@ -167,49 +176,58 @@ class _LocalAlertsScreenState extends State<LocalAlertsScreen> {
       for (ScanResult r in results) {
         if (r.advertisementData.manufacturerData.containsKey(_companyId)) {
           List<int> data = r.advertisementData.manufacturerData[_companyId]!;
+          if (data.length < 13) continue;
 
-          // --- NEW: Packet decoding ---
-          // Our new packet: [PacketType(1 byte)] + [UUID(string)]
-          if (data.isEmpty) continue;
+          ByteData byteData = ByteData.view(Uint8List.fromList(data).buffer);
 
-          int type = data[0]; // Get the type (0x01, 0x02, or 0x03)
-          String packetId = String.fromCharCodes(data.sublist(1));
+          int type = byteData.getUint8(0);
+          int packetId = byteData.getUint32(1);
+          double lat = byteData.getInt32(5) / 1000000.0;
+          double lon = byteData.getInt32(9) / 1000000.0;
 
-          // Check if we support this type and haven't seen it
-          if (_alertTypes.containsKey(type) &&
-              !_seenPacketIds.contains(packetId)) {
+          String packetIdStr = packetId.toString();
+
+          if (_alertTypes.containsKey(type)) {
+            // We removed the haptic alert for now, but this is where it would go
+
+            final newAlert = Alert(
+              type: type,
+              packetId: packetIdStr,
+              timestamp: now,
+              rssi: r.rssi,
+              isEncrypted: false,
+              lat: lat,
+              lon: lon,
+            );
+
             if (mounted) {
               setState(() {
-                _seenPacketIds.add(packetId);
-                _receivedAlerts.insert(
-                    0,
-                    Alert(
-                      type: type,
-                      packetId: packetId,
-                      timestamp: now,
-                      rssi: r.rssi,
-                    ));
+                _receivedAlerts[packetIdStr] = newAlert;
               });
             }
           }
-          // --- END NEW ---
         }
       }
     });
-
     await FlutterBluePlus.startScan();
   }
 
-  // --- NEW: broadcastSOS now takes a 'type' ---
-  Future<void> broadcastSOS(int type) async {
+  Future<void> broadcastSOS(
+      int type, bool isEncrypted, Position? position) async {
     await FlutterBluePlus.stopScan();
 
-    String packetId = _uuid.v4();
-    List<int> data = [
-      type, // Use the type we passed in
-      ...packetId.codeUnits,
-    ];
-    Uint8List dataAsUint8List = Uint8List.fromList(data);
+    var byteData = ByteData(13);
+    int packetId = _random.nextInt(4294967295);
+
+    int latInt = ((position?.latitude ?? 0) * 1000000).toInt();
+    int lonInt = ((position?.longitude ?? 0) * 1000000).toInt();
+
+    byteData.setUint8(0, type);
+    byteData.setUint32(1, packetId);
+    byteData.setInt32(5, latInt);
+    byteData.setInt32(9, lonInt);
+
+    Uint8List dataAsUint8List = byteData.buffer.asUint8List();
 
     final advData = AdvertiseData(
       includeDeviceName: false,
@@ -234,31 +252,41 @@ class _LocalAlertsScreenState extends State<LocalAlertsScreen> {
 
     await startScanning();
   }
-  // --- END NEW ---
 
-  // --- NEW: _onSosPressed now takes an AlertType ---
-  Future<void> _onSosPressed(AlertType alertType) async {
+  Future<Position?> _tryGetLocation() async {
+    try {
+      bool serviceEnabled = await Geolocator.isLocationServiceEnabled();
+      if (!serviceEnabled) {
+        if (mounted)
+          ScaffoldMessenger.of(context).showSnackBar(
+              SnackBar(content: Text("Location services are disabled.")));
+        return null;
+      }
+      return await Geolocator.getCurrentPosition(
+          desiredAccuracy: LocationAccuracy.medium);
+    } catch (e) {
+      print("Error getting location: $e");
+      if (mounted)
+        ScaffoldMessenger.of(context)
+            .showSnackBar(SnackBar(content: Text("Could not get location.")));
+      return null;
+    }
+  }
+
+  Future<void> _onSosPressed(AlertType alertType, bool isEncrypted) async {
     if (_isBroadcasting) return;
 
-    final now = DateTime.now();
-    final String tempPacketId = "SELF-TEST";
-
+    // --- THIS IS THE FIX ---
+    // We just set the _isBroadcasting flag
+    // We NO LONGER add the "MY SOS" message to the list
     setState(() {
       _isBroadcasting = true;
-      // Add the self-test message
-      _receivedAlerts.insert(
-          0,
-          Alert(
-            type: alertType.packetCode,
-            packetId: tempPacketId,
-            timestamp: now,
-            rssi: -50, // Fake strong signal
-          ));
     });
+    // --- END FIX ---
 
-    // No more "glue". Just do the real work.
     try {
-      await broadcastSOS(alertType.packetCode);
+      Position? position = await _tryGetLocation();
+      await broadcastSOS(alertType.packetCode, isEncrypted, position);
     } catch (e) {
       print("Error during broadcast: $e");
       if (mounted) {
@@ -274,11 +302,55 @@ class _LocalAlertsScreenState extends State<LocalAlertsScreen> {
       }
     }
   }
-  // --- END NEW ---
 
-  // --- THIS IS THE FULLY POLISHED UI ---
+  Future<void> _openMap(double lat, double lon) async {
+    final String googleMapsUrl =
+        'https://www.google.com/maps/search/?api=1&query=$lat,$lon';
+    final Uri uri = Uri.parse(googleMapsUrl);
+
+    if (await canLaunchUrl(uri)) {
+      await launchUrl(uri);
+    } else {
+      await Clipboard.setData(ClipboardData(text: "$lat, $lon"));
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(content: Text("Could not open map. Coordinates copied.")));
+      }
+    }
+  }
+
+  Widget _buildRssiBadge(int rssi) {
+    String text;
+    Color color;
+    Color textColor = Colors.black;
+    if (rssi > -65) {
+      text = "STRONG";
+      color = Colors.green[400]!;
+    } else if (rssi > -80) {
+      text = "MEDIUM";
+      color = Colors.yellow[600]!;
+    } else {
+      text = "WEAK";
+      color = Colors.red[800]!;
+      textColor = Colors.white;
+    }
+    return Container(
+      padding: EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+      decoration: BoxDecoration(
+        color: color,
+        borderRadius: BorderRadius.circular(8),
+      ),
+      child: Text(text,
+          style: TextStyle(
+              color: textColor, fontWeight: FontWeight.bold, fontSize: 10)),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
+    final alertsList = _receivedAlerts.values.toList();
+    alertsList.sort((a, b) => b.timestamp.compareTo(a.timestamp));
+
     return Scaffold(
       appBar: AppBar(
         title: Text("Emergency Mesh Beacon"),
@@ -289,7 +361,36 @@ class _LocalAlertsScreenState extends State<LocalAlertsScreen> {
         padding: const EdgeInsets.symmetric(horizontal: 16.0),
         child: Column(
           children: [
-            // --- NEW: Alert Buttons ---
+            if (_isBroadcasting)
+              FadeTransition(
+                opacity: _pulseController,
+                child: Container(
+                  padding: const EdgeInsets.all(12.0),
+                  margin: const EdgeInsets.only(top: 8.0),
+                  decoration: BoxDecoration(
+                    color: Colors.red[900]!.withOpacity(0.8),
+                    borderRadius: BorderRadius.circular(12),
+                    border: Border.all(color: Colors.red[300]!),
+                  ),
+                  child: Row(
+                    mainAxisAlignment: MainAxisAlignment.center,
+                    children: [
+                      SizedBox(
+                          width: 16,
+                          height: 16,
+                          child: CircularProgressIndicator(
+                              strokeWidth: 2, color: Colors.white)),
+                      SizedBox(width: 12),
+                      Text("BROADCASTING LIVE...",
+                          style: TextStyle(
+                              color: Colors.white,
+                              fontWeight: FontWeight.bold,
+                              letterSpacing: 1.2)),
+                    ],
+                  ),
+                ),
+              ),
+            SizedBox(height: 10),
             Container(
               padding: const EdgeInsets.all(16.0),
               decoration: BoxDecoration(
@@ -299,11 +400,29 @@ class _LocalAlertsScreenState extends State<LocalAlertsScreen> {
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
-                  Text(
-                    "Broadcast Alert",
-                    style: Theme.of(context).textTheme.headlineSmall,
+                  Text("Broadcast Alert",
+                      style: Theme.of(context).textTheme.headlineSmall),
+                  SizedBox(height: 10),
+
+                  SwitchListTile(
+                    title: Text("Rescuer-Only Flare",
+                        style: TextStyle(fontWeight: FontWeight.bold)),
+                    subtitle: Text(_isEncrypted
+                        ? "Encrypted (Private)"
+                        : "Public (Visible to all)"),
+                    value: _isEncrypted,
+                    onChanged: (bool value) {
+                      setState(() {
+                        _isEncrypted = value;
+                      });
+                    },
+                    secondary: Icon(_isEncrypted ? Icons.lock : Icons.lock_open,
+                        color: Colors.grey[400]),
+                    contentPadding: EdgeInsets.zero,
+                    activeColor: Colors.red[400],
                   ),
-                  SizedBox(height: 16),
+
+                  SizedBox(height: 10),
                   _buildAlertButton(_alertTypes[0x01]!), // SOS
                   SizedBox(height: 12),
                   _buildAlertButton(_alertTypes[0x02]!), // Medical
@@ -312,8 +431,6 @@ class _LocalAlertsScreenState extends State<LocalAlertsScreen> {
                 ],
               ),
             ),
-            // --- END NEW ---
-
             Padding(
               padding: const EdgeInsets.symmetric(vertical: 12.0),
               child: Text(
@@ -325,56 +442,72 @@ class _LocalAlertsScreenState extends State<LocalAlertsScreen> {
                     color: _permissionsGranted ? Colors.green : Colors.yellow),
               ),
             ),
-
             if (_canOpenSettings)
               OutlinedButton(
                 child: Text("Open App Settings"),
                 onPressed: openAppSettings,
               ),
-
             Divider(),
-
             Text("Received Alerts",
                 style: Theme.of(context).textTheme.headlineSmall),
             SizedBox(height: 10),
-
-            // --- NEW: Polished ListView ---
             Expanded(
-              child: _receivedAlerts.isEmpty
+              child: alertsList.isEmpty
                   ? Center(
                       child: Text("Listening... No alerts received yet."),
                     )
                   : ListView.builder(
-                      itemCount: _receivedAlerts.length,
+                      itemCount: alertsList.length,
                       itemBuilder: (context, index) {
-                        final alert = _receivedAlerts[index];
+                        final alert = alertsList[index];
                         final alertInfo = _alertTypes[alert.type] ??
                             AlertType(
                                 title: "Unknown",
                                 icon: Icons.question_mark,
                                 color: Colors.grey,
                                 packetCode: 0x00);
-                        final isSelfTest = alert.packetId == "SELF-TEST";
+
+                        // --- THIS IS THE FIX ---
+                        // We no longer check for 'isSelfTest'
+                        // All alerts are treated as real
 
                         return Card(
                           color: Color(0xFF2A2A2A),
                           margin: const EdgeInsets.symmetric(vertical: 6.0),
                           child: ExpansionTile(
                             leading: Icon(alertInfo.icon,
-                                color:
-                                    isSelfTest ? Colors.white : alertInfo.color,
-                                size: 36),
-                            title: Text(
-                              isSelfTest
-                                  ? "MY SOS: ${alertInfo.title}"
-                                  : alertInfo.title,
-                              style: TextStyle(
-                                fontWeight: FontWeight.bold,
-                                color:
-                                    isSelfTest ? Colors.white : alertInfo.color,
-                              ),
+                                color: alertInfo.color, size: 36),
+                            title: Row(
+                              children: [
+                                if (alert.isEncrypted)
+                                  Padding(
+                                    padding: const EdgeInsets.only(right: 8.0),
+                                    child: Icon(Icons.lock,
+                                        size: 16, color: alertInfo.color),
+                                  ),
+                                Flexible(
+                                  child: Text(
+                                    alertInfo.title, // Just show the title
+                                    style: TextStyle(
+                                      fontWeight: FontWeight.bold,
+                                      color: alertInfo.color,
+                                    ),
+                                    overflow: TextOverflow.ellipsis,
+                                  ),
+                                ),
+                              ],
                             ),
-                            subtitle: Text("Signal: ${alert.rssi} dBm"),
+                            // --- END FIX ---
+                            subtitle: Row(
+                              crossAxisAlignment: CrossAxisAlignment.center,
+                              children: [
+                                _buildRssiBadge(alert.rssi),
+                                SizedBox(width: 8),
+                                Text("(${alert.rssi} dBm)",
+                                    style: TextStyle(
+                                        fontSize: 12, color: Colors.grey[400])),
+                              ],
+                            ),
                             children: [
                               ListTile(
                                 title: Text("Time Received"),
@@ -383,11 +516,23 @@ class _LocalAlertsScreenState extends State<LocalAlertsScreen> {
                                     .substring(0, 19)
                                     .replaceFirst('T', ' ')),
                               ),
+                              if (alert.lat != null && alert.lat != 0.0)
+                                ListTile(
+                                  title: Text("Last Known Location"),
+                                  subtitle: Text("${alert.lat}, ${alert.lon}"),
+                                  trailing: IconButton(
+                                    icon: Icon(Icons.map,
+                                        color: Colors.blue[300]),
+                                    tooltip: "Open in Maps",
+                                    onPressed: () {
+                                      _openMap(alert.lat!, alert.lon!);
+                                    },
+                                  ),
+                                ),
                               ListTile(
                                 title: Text("Unique Packet ID"),
-                                subtitle: Text(isSelfTest
-                                    ? "N/A (Self-Test)"
-                                    : alert.packetId.substring(0, 13) + "..."),
+                                subtitle: Text(
+                                    alert.packetId), // Just show the real ID
                               ),
                             ],
                           ),
@@ -395,14 +540,12 @@ class _LocalAlertsScreenState extends State<LocalAlertsScreen> {
                       },
                     ),
             ),
-            // --- END NEW ---
           ],
         ),
       ),
     );
   }
 
-  // --- NEW: Helper widget for buttons ---
   Widget _buildAlertButton(AlertType alertType) {
     return ElevatedButton.icon(
       style: ElevatedButton.styleFrom(
@@ -417,9 +560,8 @@ class _LocalAlertsScreenState extends State<LocalAlertsScreen> {
             fontSize: 16, fontWeight: FontWeight.bold, color: Colors.white),
       ),
       onPressed: _permissionsGranted && !_isBroadcasting
-          ? () => _onSosPressed(alertType)
+          ? () => _onSosPressed(alertType, _isEncrypted)
           : null,
     );
   }
-  // --- END NEW ---
 }
