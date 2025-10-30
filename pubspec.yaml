@@ -10,12 +10,11 @@ dependencies:
   flutter:
     sdk: flutter
 
-  # --- YOUR 5 TOOLS ---
-  flutter_blue_plus: ^1.31.13    # The "Ears" (Scanning)
-  flutter_ble_peripheral: ^1.2.1  # The "Mouth" (Advertising) - THIS IS THE FIX
-  permission_handler: ^11.3.1   # For asking for permissions
-  provider: ^6.1.2           # The "glue" to your teammate
-  uuid: ^4.4.0               # For generating unique packet IDs
+  # --- YOUR 4 CORE TOOLS ---
+  flutter_blue_plus: ^1.31.13    # The "Ears"
+  flutter_ble_peripheral: ^1.2.1  # The "Mouth"
+  permission_handler: ^11.3.1   # For permissions
+  uuid: ^4.4.0               # For packet IDs
   # --- END YOUR TOOLS ---
 
   cupertino_icons: ^1.0.6

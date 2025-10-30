@@ -1,16 +1,9 @@
-import 'package:emergency_mesh_app/home_screen.dart'; // <-- FIXED!
-import 'package:emergency_mesh_app/network_state.dart'; // <-- FIXED!
+import 'package:emergency_mesh_app/local_alerts_screen.dart';
 import 'package:flutter/material.dart';
-import 'package:provider/provider.dart';
 
 void main() {
-  runApp(
-    // This "Provider" makes the NetworkState available to all screens
-    ChangeNotifierProvider(
-      create: (context) => NetworkState(),
-      child: const MyApp(),
-    ),
-  );
+  // No more Provider. We just run the app.
+  runApp(const MyApp());
 }
 
 class MyApp extends StatelessWidget {
@@ -23,13 +16,14 @@ class MyApp extends StatelessWidget {
       theme: ThemeData(
         primarySwatch: Colors.blue,
         brightness: Brightness.dark,
-        scaffoldBackgroundColor: Colors.black,
+        scaffoldBackgroundColor: Color(0xFF121212), // Darker background
         colorScheme: ColorScheme.dark(
           primary: Colors.blue[300]!,
-          secondary: Colors.green[300]!,
+          secondary: Colors.red[400]!, // SOS color
         ),
       ),
-      home: const HomeScreen(), // This points to your new 2-tab screen
+      // Point directly to your screen
+      home: const LocalAlertsScreen(),
       debugShowCheckedModeBanner: false,
     );
   }

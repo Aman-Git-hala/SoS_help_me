@@ -1,12 +1,43 @@
-import 'dart:async'; // For StreamSubscription
-import 'dart:typed_data'; // <-- THIS IS CRITICAL for Uint8List
+import 'dart:async';
+import 'dart:typed_data';
 import 'package:flutter/material.dart';
 import 'package:permission_handler/permission_handler.dart';
-import 'package:flutter_blue_plus/flutter_blue_plus.dart'; // The "Ears"
-import 'package:flutter_ble_peripheral/flutter_ble_peripheral.dart'; // The "Mouth"
-import 'package:provider/provider.dart';
+import 'package:flutter_blue_plus/flutter_blue_plus.dart';
+import 'package:flutter_ble_peripheral/flutter_ble_peripheral.dart';
 import 'package:uuid/uuid.dart';
-import 'network_state.dart'; // The import is correct
+
+// --- NEW DATA MODEL ---
+// We now store the packet 'type' to know what alert it was
+class Alert {
+  final int type; // 0x01=SOS, 0x02=Medical, 0x03=Rescue
+  final String packetId;
+  final DateTime timestamp;
+  final int rssi; // Signal Strength
+
+  Alert({
+    required this.type,
+    required this.packetId,
+    required this.timestamp,
+    required this.rssi,
+  });
+}
+
+// --- NEW HELPER CLASS ---
+// This holds the "authentic" info for each alert type
+class AlertType {
+  final String title;
+  final IconData icon;
+  final Color color;
+  final int packetCode; // The byte we send
+
+  AlertType({
+    required this.title,
+    required this.icon,
+    required this.color,
+    required this.packetCode,
+  });
+}
+// --- END NEW ---
 
 class LocalAlertsScreen extends StatefulWidget {
   const LocalAlertsScreen({Key? key}) : super(key: key);
@@ -15,29 +46,14 @@ class LocalAlertsScreen extends StatefulWidget {
   State<LocalAlertsScreen> createState() => _LocalAlertsScreenState();
 }
 
-class Alert {
-  final String text;
-  final DateTime timestamp;
-  Alert({required this.text, required this.timestamp});
-}
-
 class _LocalAlertsScreenState extends State<LocalAlertsScreen> {
   bool _permissionsGranted = false;
   String _permissionStatus = "Initializing...";
   bool _canOpenSettings = false;
 
-  // --- THIS IS THE "EARS" SECRET CODE ---
-  // We use this for *reading* packets
   final int _companyId = 0x1234;
-  // --- END EARS ---
-
-  // --- THIS IS THE "MOUTH" SECRET CODE ---
-  // We put this *inside* the data we send
-  final List<int> _companyIdBytes = [0x12, 0x34]; // e.g., 2 bytes for our ID
-  // --- END MOUTH ---
-
   final Set<String> _seenPacketIds = {};
-  final List<Alert> _receivedAlerts = [];
+  final List<Alert> _receivedAlerts = []; // Now a List<Alert>
 
   bool _isBroadcasting = false;
   final Uuid _uuid = Uuid();
@@ -45,6 +61,26 @@ class _LocalAlertsScreenState extends State<LocalAlertsScreen> {
 
   StreamSubscription<List<ScanResult>>? _scanSub;
   StreamSubscription<BluetoothAdapterState>? _adapterStateSub;
+
+  // --- NEW: Map of our alert types ---
+  final Map<int, AlertType> _alertTypes = {
+    0x01: AlertType(
+        title: "SOS / General",
+        icon: Icons.warning_amber_rounded,
+        color: Colors.red[400]!,
+        packetCode: 0x01),
+    0x02: AlertType(
+        title: "Medical Aid",
+        icon: Icons.medical_services,
+        color: Colors.blue[300]!,
+        packetCode: 0x02),
+    0x03: AlertType(
+        title: "Trapped / Rescue",
+        icon: Icons.people_outline,
+        color: Colors.orange[400]!,
+        packetCode: 0x03),
+  };
+  // --- END NEW ---
 
   @override
   void initState() {
@@ -129,34 +165,34 @@ class _LocalAlertsScreenState extends State<LocalAlertsScreen> {
     _scanSub = FlutterBluePlus.scanResults.listen((results) {
       final now = DateTime.now();
       for (ScanResult r in results) {
-        // --- THIS IS THE CORRECT "EARS" CODE ---
-        // We look for the Company ID in the 'manufacturerData' map
         if (r.advertisementData.manufacturerData.containsKey(_companyId)) {
-          // This packet is for us! Get the data.
           List<int> data = r.advertisementData.manufacturerData[_companyId]!;
-          // --- END "EARS" FIX ---
 
+          // --- NEW: Packet decoding ---
+          // Our new packet: [PacketType(1 byte)] + [UUID(string)]
           if (data.isEmpty) continue;
 
-          // Our packet structure (from the "Mouth" code):
-          // Byte 0: Type (0x01 = SOS)
-          // Byte 1+: Packet ID
-          int type = data[0];
+          int type = data[0]; // Get the type (0x01, 0x02, or 0x03)
           String packetId = String.fromCharCodes(data.sublist(1));
 
-          if (type == 0x01 && !_seenPacketIds.contains(packetId)) {
+          // Check if we support this type and haven't seen it
+          if (_alertTypes.containsKey(type) &&
+              !_seenPacketIds.contains(packetId)) {
             if (mounted) {
               setState(() {
                 _seenPacketIds.add(packetId);
                 _receivedAlerts.insert(
                     0,
                     Alert(
-                      text: "SOS Received! ID: ${packetId.substring(0, 6)}...",
+                      type: type,
+                      packetId: packetId,
                       timestamp: now,
+                      rssi: r.rssi,
                     ));
               });
             }
           }
+          // --- END NEW ---
         }
       }
     });
@@ -164,32 +200,22 @@ class _LocalAlertsScreenState extends State<LocalAlertsScreen> {
     await FlutterBluePlus.startScan();
   }
 
-  // This is the background hardware function
-  Future<void> broadcastSOS() async {
+  // --- NEW: broadcastSOS now takes a 'type' ---
+  Future<void> broadcastSOS(int type) async {
     await FlutterBluePlus.stopScan();
 
     String packetId = _uuid.v4();
-    List<int> typeBytes = [0x01]; // 0x01 = SOS code
-    List<int> idBytes = packetId.codeUnits;
-
-    // --- THIS IS THE CORRECT "MOUTH" CODE ---
-    // 1. Create our data list
-    List<int> finalPacket = [
-      ...typeBytes,
-      ...idBytes,
+    List<int> data = [
+      type, // Use the type we passed in
+      ...packetId.codeUnits,
     ];
+    Uint8List dataAsUint8List = Uint8List.fromList(data);
 
-    // 2. Convert that list to the Uint8List the package needs
-    Uint8List dataAsUint8List = Uint8List.fromList(finalPacket);
-
-    // 3. Pass that SINGLE Uint8List to manufacturerData,
-    //    and our Company ID to manufacturerId.
     final advData = AdvertiseData(
       includeDeviceName: false,
-      manufacturerId: _companyId, // <-- This is the ID
-      manufacturerData: dataAsUint8List, // <-- This is the data (Uint8List)
+      manufacturerId: _companyId,
+      manufacturerData: dataAsUint8List,
     );
-    // --- END "MOUTH" FIX ---
 
     try {
       await _peripheral.start(advertiseData: advData);
@@ -208,32 +234,37 @@ class _LocalAlertsScreenState extends State<LocalAlertsScreen> {
 
     await startScanning();
   }
+  // --- END NEW ---
 
-  Future<void> _onSosPressed() async {
+  // --- NEW: _onSosPressed now takes an AlertType ---
+  Future<void> _onSosPressed(AlertType alertType) async {
     if (_isBroadcasting) return;
 
     final now = DateTime.now();
+    final String tempPacketId = "SELF-TEST";
 
     setState(() {
       _isBroadcasting = true;
+      // Add the self-test message
       _receivedAlerts.insert(
           0,
           Alert(
-            text: "MY SOS: Broadcasting now...",
+            type: alertType.packetCode,
+            packetId: tempPacketId,
             timestamp: now,
+            rssi: -50, // Fake strong signal
           ));
     });
 
-    final networkState = Provider.of<NetworkState>(context, listen: false);
-    networkState.iJustSentSOS();
-
+    // No more "glue". Just do the real work.
     try {
-      await broadcastSOS();
+      await broadcastSOS(alertType.packetCode);
     } catch (e) {
       print("Error during broadcast: $e");
       if (mounted) {
-        ScaffoldMessenger.of(context)
-            .showSnackBar(SnackBar(content: Text("Error broadcasting: $e")));
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text("Error broadcasting: $e")),
+        );
       }
     } finally {
       if (mounted) {
@@ -243,54 +274,71 @@ class _LocalAlertsScreenState extends State<LocalAlertsScreen> {
       }
     }
   }
+  // --- END NEW ---
 
+  // --- THIS IS THE FULLY POLISHED UI ---
   @override
   Widget build(BuildContext context) {
     return Scaffold(
       appBar: AppBar(
-        title: Text("Local Alerts (Helper / Help Me)"),
-        backgroundColor: Colors.blue[800],
+        title: Text("Emergency Mesh Beacon"),
+        backgroundColor: Color(0xFF1F1F1F),
+        elevation: 0,
       ),
       body: Padding(
-        padding: const EdgeInsets.all(16.0),
+        padding: const EdgeInsets.symmetric(horizontal: 16.0),
         child: Column(
           children: [
-            SizedBox(height: 10),
-            ElevatedButton(
-              style: ElevatedButton.styleFrom(
-                  backgroundColor: _isBroadcasting ? Colors.grey : Colors.red,
-                  minimumSize: Size(double.infinity, 60),
-                  shape: RoundedRectangleBorder(
-                      borderRadius: BorderRadius.circular(16))),
-              onPressed: _permissionsGranted ? _onSosPressed : null,
+            // --- NEW: Alert Buttons ---
+            Container(
+              padding: const EdgeInsets.all(16.0),
+              decoration: BoxDecoration(
+                color: Color(0xFF2A2A2A),
+                borderRadius: BorderRadius.circular(16),
+              ),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    "Broadcast Alert",
+                    style: Theme.of(context).textTheme.headlineSmall,
+                  ),
+                  SizedBox(height: 16),
+                  _buildAlertButton(_alertTypes[0x01]!), // SOS
+                  SizedBox(height: 12),
+                  _buildAlertButton(_alertTypes[0x02]!), // Medical
+                  SizedBox(height: 12),
+                  _buildAlertButton(_alertTypes[0x03]!), // Trapped
+                ],
+              ),
+            ),
+            // --- END NEW ---
+
+            Padding(
+              padding: const EdgeInsets.symmetric(vertical: 12.0),
               child: Text(
-                _isBroadcasting ? "Broadcasting SOS..." : "BROADCAST SOS",
+                _permissionsGranted
+                    ? "Scanning for alerts..."
+                    : _permissionStatus,
+                textAlign: TextAlign.center,
                 style: TextStyle(
-                    fontSize: 20,
-                    fontWeight: FontWeight.bold,
-                    color: Colors.white),
+                    color: _permissionsGranted ? Colors.green : Colors.yellow),
               ),
             ),
-            SizedBox(height: 10),
-            Text(
-              _permissionStatus,
-              textAlign: TextAlign.center,
-              style: TextStyle(
-                  color: _permissionsGranted ? Colors.green : Colors.yellow),
-            ),
+
             if (_canOpenSettings)
-              Padding(
-                padding: const EdgeInsets.only(top: 10.0),
-                child: OutlinedButton(
-                  child: Text("Open App Settings"),
-                  onPressed: openAppSettings,
-                ),
+              OutlinedButton(
+                child: Text("Open App Settings"),
+                onPressed: openAppSettings,
               ),
-            SizedBox(height: 20),
+
             Divider(),
+
             Text("Received Alerts",
                 style: Theme.of(context).textTheme.headlineSmall),
             SizedBox(height: 10),
+
+            // --- NEW: Polished ListView ---
             Expanded(
               child: _receivedAlerts.isEmpty
                   ? Center(
@@ -300,27 +348,78 @@ class _LocalAlertsScreenState extends State<LocalAlertsScreen> {
                       itemCount: _receivedAlerts.length,
                       itemBuilder: (context, index) {
                         final alert = _receivedAlerts[index];
-                        final alertText = alert.text;
-                        final isSelfTest = alertText.startsWith("MY SOS");
+                        final alertInfo = _alertTypes[alert.type] ??
+                            AlertType(
+                                title: "Unknown",
+                                icon: Icons.question_mark,
+                                color: Colors.grey,
+                                packetCode: 0x00);
+                        final isSelfTest = alert.packetId == "SELF-TEST";
 
                         return Card(
-                          color: isSelfTest ? Colors.blue[900] : null,
-                          child: ListTile(
-                            leading: Icon(
-                              isSelfTest ? Icons.upload : Icons.warning,
-                              color: isSelfTest ? Colors.white : Colors.red,
+                          color: Color(0xFF2A2A2A),
+                          margin: const EdgeInsets.symmetric(vertical: 6.0),
+                          child: ExpansionTile(
+                            leading: Icon(alertInfo.icon,
+                                color:
+                                    isSelfTest ? Colors.white : alertInfo.color,
+                                size: 36),
+                            title: Text(
+                              isSelfTest
+                                  ? "MY SOS: ${alertInfo.title}"
+                                  : alertInfo.title,
+                              style: TextStyle(
+                                fontWeight: FontWeight.bold,
+                                color:
+                                    isSelfTest ? Colors.white : alertInfo.color,
+                              ),
                             ),
-                            title: Text(alertText),
-                            subtitle: Text(
-                                "Received: ${alert.timestamp.toIso8601String().substring(11, 19)}"),
+                            subtitle: Text("Signal: ${alert.rssi} dBm"),
+                            children: [
+                              ListTile(
+                                title: Text("Time Received"),
+                                subtitle: Text(alert.timestamp
+                                    .toIso8601String()
+                                    .substring(0, 19)
+                                    .replaceFirst('T', ' ')),
+                              ),
+                              ListTile(
+                                title: Text("Unique Packet ID"),
+                                subtitle: Text(isSelfTest
+                                    ? "N/A (Self-Test)"
+                                    : alert.packetId.substring(0, 13) + "..."),
+                              ),
+                            ],
                           ),
                         );
                       },
                     ),
             ),
+            // --- END NEW ---
           ],
         ),
       ),
     );
   }
+
+  // --- NEW: Helper widget for buttons ---
+  Widget _buildAlertButton(AlertType alertType) {
+    return ElevatedButton.icon(
+      style: ElevatedButton.styleFrom(
+        backgroundColor: _isBroadcasting ? Colors.grey[700] : alertType.color,
+        minimumSize: Size(double.infinity, 50),
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+      ),
+      icon: Icon(alertType.icon, color: Colors.white),
+      label: Text(
+        alertType.title,
+        style: TextStyle(
+            fontSize: 16, fontWeight: FontWeight.bold, color: Colors.white),
+      ),
+      onPressed: _permissionsGranted && !_isBroadcasting
+          ? () => _onSosPressed(alertType)
+          : null,
+    );
+  }
+  // --- END NEW ---
 }
