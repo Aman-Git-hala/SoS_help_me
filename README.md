@@ -16,12 +16,6 @@ Here it is seen that, with the extremely lightweight signal, various combination
 As it is seen here, we have recieved a distress call with location available with google map link, and bluetooth distress
 with signal strength.
 
-#### 3. Direct link to latitude and longitude on google maps
-<p align="center">
-  <img width="480" height="487" alt="image" src="https://github.com/user-attachments/assets/4aa929c4-f28b-4ba3-83b4-82cb51ef5763" />
-  <img width="241" height="513" alt="image" src="https://github.com/user-attachments/assets/12bbe9ae-969d-4f8e-b403-1335ec69e55a" />
-</p>
-
 ---
 
 ## Core Features & Technical Details
